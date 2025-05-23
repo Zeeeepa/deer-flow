@@ -130,15 +130,29 @@ This project also includes a Web UI, offering a more dynamic and engaging intera
 > You need to install the dependencies of web UI first.
 
 ```bash
-# Run both the backend and frontend servers in development mode
+# For development mode (automatically installs dependencies)
 # On macOS/Linux
 ./bootstrap.sh -d
 
 # On Windows
 bootstrap.bat -d
+
+# For production mode (builds and starts the application)
+# On macOS/Linux
+./bootstrap.sh
+
+# On Windows
+bootstrap.bat
+
+# Or build manually first (optional)
+./build.sh
 ```
 
 Open your browser and visit [`http://localhost:3000`](http://localhost:3000) to explore the web UI.
+
+> [!TIP]
+> The bootstrap script will automatically build the frontend for production mode if needed. 
+> If you encounter build issues, you can run `./build.sh` to build the frontend manually.
 
 Explore more details in the [`web`](./web/) directory.
 
