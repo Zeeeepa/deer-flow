@@ -5,19 +5,22 @@ import base64
 import json
 import logging
 import os
-from typing import List, cast
+from typing import Annotated, List, cast
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
-from langchain_core.messages import AIMessageChunk, ToolMessage
+from langchain_core.messages import AIMessageChunk, ToolMessage, BaseMessage
 from langgraph.types import Command
 
+from src.config.tools import SELECTED_RAG_PROVIDER
 from src.graph.builder import build_graph_with_memory
 from src.podcast.graph.builder import build_graph as build_podcast_graph
 from src.ppt.graph.builder import build_graph as build_ppt_graph
 from src.prose.graph.builder import build_graph as build_prose_graph
+from src.rag.builder import build_retriever
+from src.rag.retriever import Resource
 from src.server.chat_request import (
     ChatMessage,
     ChatRequest,
@@ -28,6 +31,11 @@ from src.server.chat_request import (
 )
 from src.server.mcp_request import MCPServerMetadataRequest, MCPServerMetadataResponse
 from src.server.mcp_utils import load_mcp_tools
+from src.server.rag_request import (
+    RAGConfigResponse,
+    RAGResourceRequest,
+    RAGResourcesResponse,
+)
 from src.tools import VolcengineTTS
 
 logger = logging.getLogger(__name__)
@@ -59,8 +67,10 @@ async def chat_stream(request: ChatRequest):
         _astream_workflow_generator(
             request.model_dump()["messages"],
             thread_id,
+            request.resources,
             request.max_plan_iterations,
             request.max_step_num,
+            request.max_search_results,
             request.auto_accepted_plan,
             request.interrupt_feedback,
             request.mcp_settings,
@@ -73,8 +83,10 @@ async def chat_stream(request: ChatRequest):
 async def _astream_workflow_generator(
     messages: List[ChatMessage],
     thread_id: str,
+    resources: List[Resource],
     max_plan_iterations: int,
     max_step_num: int,
+    max_search_results: int,
     auto_accepted_plan: bool,
     interrupt_feedback: str,
     mcp_settings: dict,
@@ -99,8 +111,10 @@ async def _astream_workflow_generator(
         input_,
         config={
             "thread_id": thread_id,
+            "resources": resources,
             "max_plan_iterations": max_plan_iterations,
             "max_step_num": max_step_num,
+            "max_search_results": max_search_results,
             "mcp_settings": mcp_settings,
         },
         stream_mode=["messages", "updates"],
@@ -124,7 +138,7 @@ async def _astream_workflow_generator(
                 )
             continue
         message_chunk, message_metadata = cast(
-            tuple[AIMessageChunk, dict[str, any]], event_data
+            tuple[BaseMessage, dict[str, any]], event_data
         )
         event_stream_message: dict[str, any] = {
             "thread_id": thread_id,
@@ -141,7 +155,7 @@ async def _astream_workflow_generator(
             # Tool Message - Return the result of the tool call
             event_stream_message["tool_call_id"] = message_chunk.tool_call_id
             yield _make_event("tool_call_result", event_stream_message)
-        else:
+        elif isinstance(message_chunk, AIMessageChunk):
             # AI Message - Raw message tokens
             if message_chunk.tool_calls:
                 # AI Message - Tool Call
@@ -316,3 +330,18 @@ async def mcp_server_metadata(request: MCPServerMetadataRequest):
             logger.exception(f"Error in MCP server metadata endpoint: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
         raise
+
+
+@app.get("/api/rag/config", response_model=RAGConfigResponse)
+async def rag_config():
+    """Get the config of the RAG."""
+    return RAGConfigResponse(provider=SELECTED_RAG_PROVIDER)
+
+
+@app.get("/api/rag/resources", response_model=RAGResourcesResponse)
+async def rag_resources(request: Annotated[RAGResourceRequest, Query()]):
+    """Get the resources of the RAG."""
+    retriever = build_retriever()
+    if retriever:
+        return RAGResourcesResponse(resources=retriever.list_resources(request.query))
+    return RAGResourcesResponse(resources=[])

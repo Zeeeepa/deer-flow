@@ -5,6 +5,8 @@ from typing import List, Optional, Union
 
 from pydantic import BaseModel, Field
 
+from src.rag.retriever import Resource
+
 
 class ContentItem(BaseModel):
     type: str = Field(..., description="The type of content (text, image, etc.)")
@@ -28,6 +30,9 @@ class ChatRequest(BaseModel):
     messages: Optional[List[ChatMessage]] = Field(
         [], description="History of messages between the user and the assistant"
     )
+    resources: Optional[List[Resource]] = Field(
+        [], description="Resources to be used for the research"
+    )
     debug: Optional[bool] = Field(False, description="Whether to enable debug logging")
     thread_id: Optional[str] = Field(
         "__default__", description="A specific conversation identifier"
@@ -37,6 +42,9 @@ class ChatRequest(BaseModel):
     )
     max_step_num: Optional[int] = Field(
         3, description="The maximum number of steps in a plan"
+    )
+    max_search_results: Optional[int] = Field(
+        3, description="The maximum number of search results"
     )
     auto_accepted_plan: Optional[bool] = Field(
         False, description="Whether to automatically accept the plan"

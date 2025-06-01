@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 from typing import Annotated, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -11,12 +12,12 @@ from langchain_core.tools import tool
 from langgraph.types import Command, interrupt
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from src.agents.agents import coder_agent, research_agent, create_agent
-
+from src.agents import create_agent
 from src.tools.search import LoggedTavilySearch
 from src.tools import (
     crawl_tool,
-    web_search_tool,
+    get_web_search_tool,
+    get_retriever_tool,
     python_repl_tool,
 )
 
@@ -28,7 +29,7 @@ from src.prompts.template import apply_prompt_template
 from src.utils.json_utils import repair_json_output
 
 from .types import State
-from ..config import SEARCH_MAX_RESULTS, SELECTED_SEARCH_ENGINE, SearchEngine
+from ..config import SELECTED_SEARCH_ENGINE, SearchEngine
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +45,16 @@ def handoff_to_planner(
     return
 
 
-def background_investigation_node(state: State) -> Command[Literal["planner"]]:
+def background_investigation_node(
+    state: State, config: RunnableConfig
+) -> Command[Literal["planner"]]:
     logger.info("background investigation node is running.")
+    configurable = Configuration.from_runnable_config(config)
     query = state["messages"][-1].content
-    if SELECTED_SEARCH_ENGINE == SearchEngine.TAVILY:
-        searched_content = LoggedTavilySearch(max_results=SEARCH_MAX_RESULTS).invoke(
-            {"query": query}
-        )
+    if SELECTED_SEARCH_ENGINE == SearchEngine.TAVILY.value:
+        searched_content = LoggedTavilySearch(
+            max_results=configurable.max_search_results
+        ).invoke(query)
         background_investigation_results = None
         if isinstance(searched_content, list):
             background_investigation_results = [
@@ -62,7 +66,9 @@ def background_investigation_node(state: State) -> Command[Literal["planner"]]:
                 f"Tavily search returned malformed response: {searched_content}"
             )
     else:
-        background_investigation_results = web_search_tool.invoke(query)
+        background_investigation_results = get_web_search_tool(
+            configurable.max_search_results
+        ).invoke(query)
     return Command(
         update={
             "background_investigation_results": json.dumps(
@@ -201,10 +207,11 @@ def human_feedback_node(
 
 
 def coordinator_node(
-    state: State,
+    state: State, config: RunnableConfig
 ) -> Command[Literal["planner", "background_investigator", "__end__"]]:
     """Coordinator node that communicate with customers."""
     logger.info("Coordinator talking.")
+    configurable = Configuration.from_runnable_config(config)
     messages = apply_prompt_template("coordinator", state)
     response = (
         get_llm_by_type(AGENT_LLM_MAP["coordinator"])
@@ -237,7 +244,7 @@ def coordinator_node(
         logger.debug(f"Coordinator response: {response}")
 
     return Command(
-        update={"locale": locale},
+        update={"locale": locale, "resources": configurable.resources},
         goto=goto,
     )
 
@@ -321,14 +328,14 @@ async def _execute_agent_step(
         logger.warning("No unexecuted step found")
         return Command(goto="research_team")
 
-    logger.info(f"Executing step: {current_step.title}")
+    logger.info(f"Executing step: {current_step.title}, agent: {agent_name}")
 
     # Format completed steps information
     completed_steps_info = ""
     if completed_steps:
         completed_steps_info = "# Existing Research Findings\n\n"
         for i, step in enumerate(completed_steps):
-            completed_steps_info += f"## Existing Finding {i+1}: {step.title}\n\n"
+            completed_steps_info += f"## Existing Finding {i + 1}: {step.title}\n\n"
             completed_steps_info += f"<finding>\n{step.execution_res}\n</finding>\n\n"
 
     # Prepare the input for the agent with completed steps info
@@ -342,6 +349,19 @@ async def _execute_agent_step(
 
     # Add citation reminder for researcher agent
     if agent_name == "researcher":
+        if state.get("resources"):
+            resources_info = "**The user mentioned the following resource files:**\n\n"
+            for resource in state.get("resources"):
+                resources_info += f"- {resource.title} ({resource.description})\n"
+
+            agent_input["messages"].append(
+                HumanMessage(
+                    content=resources_info
+                    + "\n\n"
+                    + "You MUST use the **local_search_tool** to retrieve the information from the resource files.",
+                )
+            )
+
         agent_input["messages"].append(
             HumanMessage(
                 content="IMPORTANT: DO NOT include inline citations in the text. Instead, track all sources and include a References section at the end using link reference format. Include an empty line between each citation for better readability. Use this format for each reference:\n- [Source Title](URL)\n\n- [Another Source](URL)",
@@ -350,7 +370,32 @@ async def _execute_agent_step(
         )
 
     # Invoke the agent
-    result = await agent.ainvoke(input=agent_input)
+    default_recursion_limit = 25
+    try:
+        env_value_str = os.getenv("AGENT_RECURSION_LIMIT", str(default_recursion_limit))
+        parsed_limit = int(env_value_str)
+
+        if parsed_limit > 0:
+            recursion_limit = parsed_limit
+            logger.info(f"Recursion limit set to: {recursion_limit}")
+        else:
+            logger.warning(
+                f"AGENT_RECURSION_LIMIT value '{env_value_str}' (parsed as {parsed_limit}) is not positive. "
+                f"Using default value {default_recursion_limit}."
+            )
+            recursion_limit = default_recursion_limit
+    except ValueError:
+        raw_env_value = os.getenv("AGENT_RECURSION_LIMIT")
+        logger.warning(
+            f"Invalid AGENT_RECURSION_LIMIT value: '{raw_env_value}'. "
+            f"Using default value {default_recursion_limit}."
+        )
+        recursion_limit = default_recursion_limit
+
+    logger.info(f"Agent input: {agent_input}")
+    result = await agent.ainvoke(
+        input=agent_input, config={"recursion_limit": recursion_limit}
+    )
 
     # Process the result
     response_content = result["messages"][-1].content
@@ -378,7 +423,6 @@ async def _setup_and_execute_agent_step(
     state: State,
     config: RunnableConfig,
     agent_type: str,
-    default_agent,
     default_tools: list,
 ) -> Command[Literal["research_team"]]:
     """Helper function to set up an agent with appropriate tools and execute a step.
@@ -392,7 +436,6 @@ async def _setup_and_execute_agent_step(
         state: The current state
         config: The runnable config
         agent_type: The type of agent ("researcher" or "coder")
-        default_agent: The default agent to use if no MCP servers are configured
         default_tools: The default tools to add to the agent
 
     Returns:
@@ -430,8 +473,9 @@ async def _setup_and_execute_agent_step(
             agent = create_agent(agent_type, agent_type, loaded_tools, agent_type)
             return await _execute_agent_step(state, agent, agent_type)
     else:
-        # Use default agent if no MCP servers are configured
-        return await _execute_agent_step(state, default_agent, agent_type)
+        # Use default tools if no MCP servers are configured
+        agent = create_agent(agent_type, agent_type, default_tools, agent_type)
+        return await _execute_agent_step(state, agent, agent_type)
 
 
 async def researcher_node(
@@ -439,12 +483,17 @@ async def researcher_node(
 ) -> Command[Literal["research_team"]]:
     """Researcher node that do research"""
     logger.info("Researcher node is researching.")
+    configurable = Configuration.from_runnable_config(config)
+    tools = [get_web_search_tool(configurable.max_search_results), crawl_tool]
+    retriever_tool = get_retriever_tool(state.get("resources", []))
+    if retriever_tool:
+        tools.insert(0, retriever_tool)
+    logger.info(f"Researcher tools: {tools}")
     return await _setup_and_execute_agent_step(
         state,
         config,
         "researcher",
-        research_agent,
-        [web_search_tool, crawl_tool],
+        tools,
     )
 
 
@@ -457,6 +506,5 @@ async def coder_node(
         state,
         config,
         "coder",
-        coder_agent,
         [python_repl_tool],
     )

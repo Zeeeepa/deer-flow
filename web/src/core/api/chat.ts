@@ -4,6 +4,7 @@
 import { env } from "~/env";
 
 import type { MCPServerMetadata } from "../mcp";
+import type { Resource } from "../messages";
 import { extractReplayIdFromSearchParams } from "../replay/get-replay-id";
 import { fetchStream } from "../sse";
 import { sleep } from "../utils";
@@ -15,9 +16,11 @@ export async function* chatStream(
   userMessage: string,
   params: {
     thread_id: string;
+    resources?: Array<Resource>;
     auto_accepted_plan: boolean;
     max_plan_iterations: number;
     max_step_num: number;
+    max_search_results?: number;
     interrupt_feedback?: string;
     enable_background_investigation: boolean;
     mcp_settings?: {
@@ -61,12 +64,14 @@ async function* chatReplayStream(
     auto_accepted_plan: boolean;
     max_plan_iterations: number;
     max_step_num: number;
+    max_search_results?: number;
     interrupt_feedback?: string;
   } = {
     thread_id: "__mock__",
     auto_accepted_plan: false,
     max_plan_iterations: 3,
     max_step_num: 1,
+    max_search_results: 3,
     interrupt_feedback: undefined,
   },
   options: { abortSignal?: AbortSignal } = {},
@@ -98,7 +103,8 @@ async function* chatReplayStream(
   const text = await fetchReplay(replayFilePath, {
     abortSignal: options.abortSignal,
   });
-  const chunks = text.split("\n\n");
+  const normalizedText = text.replace(/\r\n/g, "\n");
+  const chunks = normalizedText.split("\n\n");
   for (const chunk of chunks) {
     const [eventRaw, dataRaw] = chunk.split("\n") as [string, string];
     const [, event] = eventRaw.split("event: ", 2) as [string, string];
@@ -157,6 +163,7 @@ export async function fetchReplayTitle() {
       auto_accepted_plan: false,
       max_plan_iterations: 3,
       max_step_num: 1,
+      max_search_results: 3,
     },
     {},
   );
